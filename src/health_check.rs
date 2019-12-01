@@ -1,8 +1,7 @@
 use crate::health_check::health::health_check_response::ServingStatus;
 use crate::health_check::health::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use futures_locks::RwLock;
+use std::sync::{Mutex, RwLock};
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Request, Response, Status};
 
@@ -10,19 +9,13 @@ pub mod health {
     tonic::include_proto!("grpc.health.v1");
 }
 
-#[derive(Debug, Clone)]
-enum StatusChange {
-    All,
-    Specific(String),
-}
-
 type HealthResult<T> = Result<Response<T>, Status>;
 type ResponseStream<T> = mpsc::Receiver<Result<T, Status>>;
 
 pub struct HealthCheckService {
     services: RwLock<HashMap<String, ServingStatus>>,
-    signaller: Mutex<watch::Sender<Option<StatusChange>>>,
-    subscriber: watch::Receiver<Option<StatusChange>>,
+    signaller: Mutex<watch::Sender<Option<(String, ServingStatus)>>>,
+    subscriber: watch::Receiver<Option<(String, ServingStatus)>>,
 }
 
 impl HealthCheckService {
@@ -31,38 +24,39 @@ impl HealthCheckService {
         services.insert(String::new(), ServingStatus::Serving);
         let (tx, rx) = watch::channel(None);
         HealthCheckService {
-            services: Arc::new(RwLock::new(services)),
+            services: RwLock::new(services),
             signaller: Mutex::new(tx),
             subscriber: rx,
         }
     }
 
-    pub async fn set_status(&mut self, service_name: &str, status: ServingStatus) -> Result<(), ()> {
-        if let Ok(mut writer) = self.services.write().await {
-            writer.insert(service_name.to_string(), status);
-            if let Ok(sig) = self.signaller.lock() {
-                sig.broadcast(Some(StatusChange::Specific(service_name.to_string())))
-                    .map_err(|_| ())?;
-                Ok(())
-            } else {
-                Err(())
+    pub fn set_status(&mut self, service_name: &str, status: ServingStatus) -> Result<(), ()> {
+        if let Ok(mut writer) = self.services.write() {
+            let last = writer.insert(service_name.to_string(), status);
+            if last.is_none() || last.unwrap() != status {
+                if let Ok(sig) = self.signaller.lock() {
+                    sig.broadcast(Some((service_name.to_string(), status)))
+                        .map_err(|_| ())?;
+                }
             }
+            Ok(())
         } else {
             Err(())
         }
     }
 
-    pub async fn shutdown(&mut self) -> Result<(), ()> {
-        if let Ok(mut writer) = self.services.write().await {
-            for status in writer.values_mut() {
-                *status = ServingStatus::NotServing;
+    pub fn shutdown(&mut self) -> Result<(), ()> {
+        if let Ok(mut writer) = self.services.write() {
+            for (name, status) in writer.iter_mut() {
+                if *status != ServingStatus::NotServing {
+                    *status = ServingStatus::NotServing;
+                    
+                    if let Ok(sig) = self.signaller.lock() {
+                        sig.broadcast(Some((name.to_string(), *status))).map_err(|_| ())?;
+                    }
+                }
             }
-            if let Ok(sig) = self.signaller.lock() {
-                sig.broadcast(Some(StatusChange::All)).map_err(|_| ())?;
-                Ok(())
-            } else {
-                Err(())
-            }
+            Ok(())
         } else {
             Err(())
         }
@@ -75,7 +69,7 @@ impl server::Health for HealthCheckService {
         &self,
         request: Request<HealthCheckRequest>,
     ) -> HealthResult<HealthCheckResponse> {
-        if let Ok(services) = self.services.read().await {
+        if let Ok(services) = self.services.read() {
             match services.get(&request.get_ref().service) {
                 Some(status) => {
                     let response = Response::new(HealthCheckResponse {
@@ -97,43 +91,20 @@ impl server::Health for HealthCheckService {
 
     async fn watch(&self, request: Request<HealthCheckRequest>) -> HealthResult<Self::WatchStream> {
         let name = &request.get_ref().service;
-        {
-            let services = self.services
-                .read()
-                .await
-                .map_err(|_| Status::new(Code::Internal, "Unable to check status of service"))?;
-            // Do an initial check to make sure it exists
-            if services.get(name).is_none() {
-                return Err(Status::new(Code::NotFound, ""));
-            }
-        }
         let (mut tx, res_rx) = mpsc::channel(10);
+        
         let mut rx = self.subscriber.clone();
         while let Some(value) = rx.recv().await {
-            let service_lock = self.services.clone();
             match value {
-                Some(StatusChange::Specific(changed_name)) => {
+                Some((changed_name, status)) => {
                     if *name == changed_name {
-                        if let Ok(services) = service_lock.read().await {
-                            let status = services.get(name).unwrap();
-                            tx.send(Ok(HealthCheckResponse {
-                                status: (*status) as i32,
-                            }))
-                            .await;
-                        }
-                    }
-                }
-                Some(StatusChange::All) => {
-                    // send it
-                    if let Ok(services) = service_lock.read().await {
-                        let status = services.get(name).unwrap();
-                        tx.send(Ok(HealthCheckResponse {
-                            status: (*status) as i32,
+                        let _ = tx.send(Ok(HealthCheckResponse {
+                            status: status as i32,
                         }))
                         .await;
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
         Ok(Response::new(res_rx))
