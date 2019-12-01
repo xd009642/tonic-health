@@ -95,46 +95,6 @@ impl server::Health for HealthCheckService {
     type WatchStream = ResponseStream<HealthCheckResponse>;
 
     async fn watch(&self, request: Request<HealthCheckRequest>) -> HealthResult<Self::WatchStream> {
-        let name = &request.get_ref().service;
-        {
-            let service_lock = self.services.clone();
-            let services = service_lock
-                .read()
-                .map_err(|_| Status::new(Code::Internal, "Unable to check status of service"))?;
-            // Do an initial check to make sure it exists
-            if services.get(name).is_none() {
-                return Err(Status::new(Code::NotFound, ""));
-            }
-        }
-        let (mut tx, res_rx) = mpsc::channel(10);
-        let mut rx = self.subscriber.clone();
-        while let Some(value) = rx.recv().await {
-            let service_lock = self.services.clone();
-            match value {
-                Some(StatusChange::Specific(changed_name)) => {
-                    if *name == changed_name {
-                        if let Ok(services) = service_lock.read() {
-                            let status = services.get(name).unwrap();
-                            tx.send(Ok(HealthCheckResponse {
-                                status: (*status) as i32,
-                            }))
-                            .await;
-                        }
-                    }
-                }
-                Some(StatusChange::All) => {
-                    // send it
-                    if let Ok(services) = service_lock.read() {
-                        let status = services.get(name).unwrap();
-                        tx.send(Ok(HealthCheckResponse {
-                            status: (*status) as i32,
-                        }))
-                        .await;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(Response::new(res_rx))
+        Err(Status::new(Code::Unimplemented, ""))
     }
 }
