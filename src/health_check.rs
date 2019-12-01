@@ -1,7 +1,8 @@
 use crate::health_check::health::health_check_response::ServingStatus;
 use crate::health_check::health::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+use futures_locks::RwLock;
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Request, Response, Status};
 
@@ -19,7 +20,7 @@ type HealthResult<T> = Result<Response<T>, Status>;
 type ResponseStream<T> = mpsc::Receiver<Result<T, Status>>;
 
 pub struct HealthCheckService {
-    services: Arc<RwLock<HashMap<String, ServingStatus>>>,
+    services: RwLock<HashMap<String, ServingStatus>>,
     signaller: Mutex<watch::Sender<Option<StatusChange>>>,
     subscriber: watch::Receiver<Option<StatusChange>>,
 }
@@ -36,8 +37,8 @@ impl HealthCheckService {
         }
     }
 
-    pub fn set_status(&mut self, service_name: &str, status: ServingStatus) -> Result<(), ()> {
-        if let Ok(mut writer) = self.services.clone().write() {
+    pub async fn set_status(&mut self, service_name: &str, status: ServingStatus) -> Result<(), ()> {
+        if let Ok(mut writer) = self.services.write().await {
             writer.insert(service_name.to_string(), status);
             if let Ok(sig) = self.signaller.lock() {
                 sig.broadcast(Some(StatusChange::Specific(service_name.to_string())))
@@ -51,8 +52,8 @@ impl HealthCheckService {
         }
     }
 
-    pub fn shutdown(&mut self) -> Result<(), ()> {
-        if let Ok(mut writer) = self.services.clone().write() {
+    pub async fn shutdown(&mut self) -> Result<(), ()> {
+        if let Ok(mut writer) = self.services.write().await {
             for status in writer.values_mut() {
                 *status = ServingStatus::NotServing;
             }
@@ -74,7 +75,7 @@ impl server::Health for HealthCheckService {
         &self,
         request: Request<HealthCheckRequest>,
     ) -> HealthResult<HealthCheckResponse> {
-        if let Ok(services) = self.services.clone().read() {
+        if let Ok(services) = self.services.read().await {
             match services.get(&request.get_ref().service) {
                 Some(status) => {
                     let response = Response::new(HealthCheckResponse {
@@ -97,9 +98,9 @@ impl server::Health for HealthCheckService {
     async fn watch(&self, request: Request<HealthCheckRequest>) -> HealthResult<Self::WatchStream> {
         let name = &request.get_ref().service;
         {
-            let service_lock = self.services.clone();
-            let services = service_lock
+            let services = self.services
                 .read()
+                .await
                 .map_err(|_| Status::new(Code::Internal, "Unable to check status of service"))?;
             // Do an initial check to make sure it exists
             if services.get(name).is_none() {
@@ -113,7 +114,7 @@ impl server::Health for HealthCheckService {
             match value {
                 Some(StatusChange::Specific(changed_name)) => {
                     if *name == changed_name {
-                        if let Ok(services) = service_lock.read() {
+                        if let Ok(services) = service_lock.read().await {
                             let status = services.get(name).unwrap();
                             tx.send(Ok(HealthCheckResponse {
                                 status: (*status) as i32,
@@ -124,7 +125,7 @@ impl server::Health for HealthCheckService {
                 }
                 Some(StatusChange::All) => {
                     // send it
-                    if let Ok(services) = service_lock.read() {
+                    if let Ok(services) = service_lock.read().await {
                         let status = services.get(name).unwrap();
                         tx.send(Ok(HealthCheckResponse {
                             status: (*status) as i32,
