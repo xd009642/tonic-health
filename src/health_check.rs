@@ -1,7 +1,7 @@
 use crate::health_check::health::health_check_response::ServingStatus;
 use crate::health_check::health::*;
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Request, Response, Status};
 
@@ -13,7 +13,7 @@ type HealthResult<T> = Result<Response<T>, Status>;
 type ResponseStream<T> = mpsc::Receiver<Result<T, Status>>;
 
 pub struct HealthCheckService {
-    services: RwLock<HashMap<String, ServingStatus>>,
+    services: Mutex<HashMap<String, ServingStatus>>,
     signaller: Mutex<watch::Sender<Option<(String, ServingStatus)>>>,
     subscriber: watch::Receiver<Option<(String, ServingStatus)>>,
 }
@@ -24,14 +24,22 @@ impl HealthCheckService {
         services.insert(String::new(), ServingStatus::Serving);
         let (tx, rx) = watch::channel(None);
         HealthCheckService {
-            services: RwLock::new(services),
+            services: Mutex::new(services),
             signaller: Mutex::new(tx),
             subscriber: rx,
         }
     }
 
+    pub fn get_status(&self, service_name: &str) -> Option<ServingStatus> {
+        if let Ok(services) = self.services.lock() {
+            services.get(service_name).copied()
+        } else {
+            None
+        }
+    }
+
     pub fn set_status(&mut self, service_name: &str, status: ServingStatus) -> Result<(), ()> {
-        if let Ok(mut writer) = self.services.write() {
+        if let Ok(writer) = self.services.get_mut() {
             let last = writer.insert(service_name.to_string(), status);
             if last.is_none() || last.unwrap() != status {
                 if let Ok(sig) = self.signaller.lock() {
@@ -46,7 +54,7 @@ impl HealthCheckService {
     }
 
     pub fn shutdown(&mut self) -> Result<(), ()> {
-        if let Ok(mut writer) = self.services.write() {
+        if let Ok(writer) = self.services.get_mut() {
             for (name, status) in writer.iter_mut() {
                 if *status != ServingStatus::NotServing {
                     *status = ServingStatus::NotServing;
@@ -69,7 +77,7 @@ impl server::Health for HealthCheckService {
         &self,
         request: Request<HealthCheckRequest>,
     ) -> HealthResult<HealthCheckResponse> {
-        if let Ok(services) = self.services.read() {
+        if let Ok(services) = self.services.lock() {
             match services.get(&request.get_ref().service) {
                 Some(status) => {
                     let response = Response::new(HealthCheckResponse {
@@ -92,21 +100,29 @@ impl server::Health for HealthCheckService {
     async fn watch(&self, request: Request<HealthCheckRequest>) -> HealthResult<Self::WatchStream> {
         let name = &request.get_ref().service;
         let (mut tx, res_rx) = mpsc::channel(10);
-        
-        let mut rx = self.subscriber.clone();
-        while let Some(value) = rx.recv().await {
-            match value {
-                Some((changed_name, status)) => {
-                    if *name == changed_name {
-                        let _ = tx.send(Ok(HealthCheckResponse {
-                            status: status as i32,
-                        }))
-                        .await;
-                    }
-                },
-                _ => {},
+
+        if let Some(status) = self.get_status(name) {
+            let _ = tx.send(Ok(HealthCheckResponse {
+                status: status as i32,
+            }))
+            .await;
+            let mut rx = self.subscriber.clone();
+            while let Some(value) = rx.recv().await {
+                match value {
+                    Some((changed_name, status)) => {
+                        if *name == changed_name {
+                            let _ = tx.send(Ok(HealthCheckResponse {
+                                status: status as i32,
+                            }))
+                            .await;
+                        }
+                    },
+                    _ => {},
+                }
             }
+            Ok(Response::new(res_rx))
+        } else {
+            Err(Status::new(Code::NotFound, ""))
         }
-        Ok(Response::new(res_rx))
     }
 }
