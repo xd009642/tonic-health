@@ -1,0 +1,18 @@
+[package]
+name = "tonic-health"
+version = "0.1.0"
+authors = ["xd009642 <danielmckenna93@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+bytes = "0.4"
+futures-preview = "0.3.0-alpha.19"
+prost = "0.5"
+prost-types = "0.5"
+signal-hook = {version = "0.1.12", features = ["tokio-support"]}
+tokio = "0.2.0-alpha.6"
+tonic = "0.1.0-alpha.1"
+
+[build-dependencies]
+tonic-build = "0.1.0-alpha.3"
+
