@@ -1,4 +1,1 @@
-# Tonic-Health
-
-Sane default health-check implementation for tonic grpc. Currently a work in
-progress.
+**This crate is deprecated see https://github.com/hyperium/tonic/tree/master/tonic-health**
